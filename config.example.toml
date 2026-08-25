@@ -1,0 +1,100 @@
+# Пример конфигурации vpn-orchestrator
+# Скопируйте: cp config.example.toml /etc/vpn-orchestrator/config.toml
+
+[server]
+# Серверный VPN-интерфейс (принимает клиентов)
+interface = "wg0"
+# type = "wireguard"          # wireguard (по умолчанию) или amneziawg
+subnet = "10.42.42.0/24"
+listen_port = 51820
+# Если серверный интерфейс уже поднят внешним инструментом (wg-easy, wg-quick и т.д.) —
+# удалите config_path или запускайте с --skip-server.
+# Оркестратор только проверит что интерфейс жив и будет мониторить пиров.
+# config_path = "/etc/wireguard/wg0.conf"
+
+# === Upstream VPN — список в порядке приоритета ===
+# Первый здоровый upstream становится активным.
+# При недоступности активного — автоматический failover на следующий.
+# enabled = false — игнорируется (не запускается, не участвует в failover).
+
+# Primary: WireGuard
+# [[upstream]]
+# name = "primary-wg"
+# type = "wireguard"
+# interface = "wg1"
+# config_path = "/etc/wireguard/wg1.conf"
+# enabled = true
+# health_check_interval = 10       # секунды между проверками
+# health_check_target = "8.8.8.8"  # IP для ping через интерфейс
+# health_check_timeout = 3         # таймаут ping (секунды)
+# failover_threshold = 3           # неудач подряд до переключения
+
+# Backup 1: AmneziaWG
+[[upstream]]
+name = "play2go"
+type = "amneziawg"
+interface = "awg0"
+config_path = "/etc/amnezia/play2go.conf"
+enabled = true
+health_check_interval = 10
+health_check_target = "1.1.1.1"
+health_check_timeout = 3
+failover_threshold = 3
+
+[[upstream]]
+name = "play2go-lowcost"
+type = "amneziawg"
+interface = "awg1"
+config_path = "/etc/amnezia/play2go-lowcost.conf"
+health_check_interval = 10
+health_check_target = "1.1.1.1"
+health_check_timeout = 3
+failover_threshold = 3
+
+# Backup 2: Xray / 3x-ui (TUN-режим)
+# [[upstream]]
+# name = "backup-3xui"
+# type = "xray"
+# interface = "tun0"
+# config_path = "/etc/xray/config.json"
+# health_check_interval = 15
+# health_check_target = "1.1.1.1"
+# health_check_timeout = 5
+# failover_threshold = 3
+
+[routing]
+enable_ip_forward = true
+route_table = 100
+# Дополнительные префиксы, маршрутизируемые через upstream
+extra_prefixes = []
+
+[nat]
+masquerade = true
+use_nftables = true
+
+# === Замер скорости upstream-ов ===
+# Периодически загружает тестовый файл через каждый upstream-интерфейс
+# и логирует скорость. При min_mbps > 0 — переключается на более быстрый,
+# если активный upstream ниже порога.
+
+[speed_test]
+enabled = true
+url = "https://speed.cloudflare.com/__down?bytes=10000000"  # 10 MB
+interval = 300          # секунды между замерами
+timeout = 30            # таймаут загрузки (секунды)
+min_mbps = 5.0          # порог переключения (0 = только логирование)
+
+# === Логирование ===
+# По умолчанию логи идут в stdout.
+# Укажите file, чтобы писать в файл вместо stdout.
+# level: trace / debug / info / warn / error (по умолчанию info).
+# max_size_mb: ротация при превышении размера (0 = без лимита).
+# keep_mb: сколько МБ оставить при ротации (последние записи).
+# Можно отключить полностью: enabled = false или флаг --quiet.
+
+[logging]
+enabled = true
+file = "/var/log/vpn-orchestrator.log"
+level = "info"
+max_size_mb = 10            # ротация при превышении (0 = без лимита)
+keep_mb = 1                 # сколько МБ оставить при ротации

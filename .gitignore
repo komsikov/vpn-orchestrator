@@ -1,0 +1,33 @@
+# Rust
+/target
+**/*.rs.bk
+*.pdb
+
+# Cargo
+# Cargo.lock оставляем под VCS для бинарного crate
+
+# Конфигурация приложения (примеры с .example под контролем версий)
+/config.toml
+/wireguard/*.conf
+
+# Секреты / ключи
+*.key
+*.pem
+*.p12
+
+# Логи
+*.log
+logs/
+
+# IDE / редакторы
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Окружение
+.env
+.env.*
+!.env.example
