@@ -9,10 +9,39 @@
 
 use anyhow::{Context, Result};
 use ipnetwork::IpNetwork;
+use serde::Deserialize;
 use tokio::process::Command;
 use tracing::{info, warn};
 
 use crate::config::Config;
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct RoutingConfig {
+    #[serde(default = "crate::config::default_true")]
+    pub enable_ip_forward: bool,
+    #[serde(default = "default_route_table")]
+    pub route_table: u32,
+    #[serde(default)]
+    pub extra_prefixes: Vec<IpNetwork>,
+}
+
+impl Default for RoutingConfig {
+    fn default() -> Self {
+        Self { enable_ip_forward: true, route_table: default_route_table(), extra_prefixes: Vec::new() }
+    }
+}
+
+fn default_route_table() -> u32 { 100 }
+
+pub(crate) fn validate_route_table(table: u32) -> Result<()> {
+    match table {
+        0 | 253 | 254 | 255 => {
+            anyhow::bail!("routing.route_table: значение {table} зарезервировано ядром Linux");
+        }
+        _ => Ok(()),
+    }
+}
 
 /// Управляет policy routing: `ip rule` + `ip route` в отдельной таблице.
 pub struct RoutingSetup {

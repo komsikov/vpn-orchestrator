@@ -4,8 +4,24 @@
 //! При failover — правила пересоздаются на новый upstream-интерфейс.
 
 use anyhow::{Context, Result};
+use serde::Deserialize;
 use tokio::process::Command;
 use tracing::{debug, info, warn};
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct NatConfig {
+    #[serde(default = "crate::config::default_true")]
+    pub masquerade: bool,
+    #[serde(default = "crate::config::default_true")]
+    pub use_nftables: bool,
+}
+
+impl Default for NatConfig {
+    fn default() -> Self {
+        Self { masquerade: true, use_nftables: true }
+    }
+}
 
 /// Управляет NAT (masquerade) и FORWARD правилами.
 ///

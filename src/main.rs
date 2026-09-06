@@ -16,8 +16,10 @@
 //! - [`routing`] — policy routing (ip rule, ip route)
 //! - [`nat`] — NAT/FORWARD (nftables / iptables)
 //! - [`util`] — хелперы (ping, проверка интерфейса, speed test)
+//! - [`monitor`] — мониторинг VPN: multi-target probes, EWMA, состояния
 
 mod config;
+mod monitor;
 mod nat;
 mod routing;
 mod server;
@@ -97,11 +99,22 @@ async fn main() -> Result<()> {
 
     // Мониторинг пиров сервера — в отдельной задаче.
     let monitor_server = ServerInterface::new(&config);
-    let monitor = tokio::spawn(async move {
+    let server_monitor = tokio::spawn(async move {
         monitor_server
             .monitor_loop(Duration::from_secs(cli.monitor_interval))
             .await;
     });
+
+    // Prometheus metrics endpoint (если включён в [monitoring]).
+    let prometheus = if upstreams.prometheus_enabled() {
+        let port = upstreams.prometheus_port();
+        let shared = upstreams.shared_metrics();
+        Some(tokio::spawn(async move {
+            monitor::serve_prometheus(shared, port).await;
+        }))
+    } else {
+        None
+    };
 
     // Failover-цикл работает параллельно с ожиданием сигнала остановки.
     tokio::select! {
@@ -113,7 +126,10 @@ async fn main() -> Result<()> {
         }
     }
 
-    monitor.abort();
+    server_monitor.abort();
+    if let Some(h) = prometheus {
+        h.abort();
+    }
     info!("остановка vpn-orchestrator");
     upstreams.shutdown().await;
 
@@ -194,11 +210,11 @@ fn init_logging(
         if config.max_size_mb > 0 {
             let p = path.to_path_buf();
             let max_bytes = config.max_size_mb * 1_000_000;
-            let keep_bytes = config.keep_mb * 1_000_000;
+            let max_files = config.max_files;
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(Duration::from_secs(60)).await;
-                    if let Err(e) = rotate_if_needed(&p, max_bytes, keep_bytes) {
+                    if let Err(e) = rotate_log(&p, max_bytes, max_files) {
                         eprintln!("log rotation error: {e}");
                     }
                 }
@@ -215,21 +231,20 @@ fn init_logging(
     }
 }
 
-/// Проверяет размер лог-файла и обрезает при превышении лимита.
-/// Сохраняет последние `keep_bytes` байт — актуальные логи не теряются.
-fn rotate_if_needed(path: &std::path::Path, max_bytes: u64, keep_bytes: u64) -> Result<()> {
-    let metadata = std::fs::metadata(path)?;
-    let size = metadata.len();
-    if size <= max_bytes {
-        return Ok(());
+fn rotate_log(path: &std::path::Path, max_bytes: u64, max_files: u32) -> Result<()> {
+    if std::fs::metadata(path)?.len() <= max_bytes { return Ok(()); }
+
+    for i in (1..=max_files).rev() {
+        let src = path.with_extension(format!("{}", i));
+        if !src.exists() { continue; }
+        if i >= max_files {
+            let _ = std::fs::remove_file(&src);
+        } else {
+            let _ = std::fs::rename(&src, path.with_extension(format!("{}", i + 1)));
+        }
     }
 
-    let content = std::fs::read(path)?;
-    let start = content.len().saturating_sub(keep_bytes as usize);
-    let tail = &content[start..];
-
-    std::fs::write(path, tail)?;
-    info!(file = %path.display(), old_size = size, "лог-файл ротирован");
-
+    std::fs::rename(path, path.with_extension("1"))?;
+    info!(file = %path.display(), "лог-файл ротирован");
     Ok(())
 }

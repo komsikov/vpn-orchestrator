@@ -8,12 +8,35 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use ipnetwork::IpNetwork;
+use serde::Deserialize;
 use tokio::process::Command;
 use tokio::time;
 use tracing::{error, info, warn};
 
-use crate::config::{Config, ServerType};
+use crate::config::Config;
 use crate::util::interface_is_up;
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServerConfig {
+    pub interface: String,
+    #[serde(default)]
+    pub server_type: ServerType,
+    pub subnet: IpNetwork,
+    #[serde(default = "default_listen_port")]
+    pub listen_port: u16,
+    pub config_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ServerType {
+    #[default]
+    Wireguard,
+    Amneziawg,
+}
+
+fn default_listen_port() -> u16 { 51820 }
 
 /// Управление серверным VPN-интерфейсом (принимает клиентов).
 ///
