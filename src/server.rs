@@ -20,7 +20,7 @@ use crate::util::interface_is_up;
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
     pub interface: String,
-    #[serde(default)]
+    #[serde(default, rename = "type", alias = "server_type")]
     pub server_type: ServerType,
     pub subnet: IpNetwork,
     #[serde(default = "default_listen_port")]
@@ -36,7 +36,9 @@ pub enum ServerType {
     Amneziawg,
 }
 
-fn default_listen_port() -> u16 { 51820 }
+fn default_listen_port() -> u16 {
+    51820
+}
 
 /// Управление серверным VPN-интерфейсом (принимает клиентов).
 ///
@@ -48,6 +50,7 @@ pub struct ServerInterface {
     config_path: Option<PathBuf>,
     quick_binary: &'static str,
     show_binary: &'static str,
+    started: bool,
 }
 
 impl ServerInterface {
@@ -62,14 +65,19 @@ impl ServerInterface {
             config_path: config.server.config_path.clone(),
             quick_binary,
             show_binary,
+            started: false,
         }
     }
 
     /// Поднимает интерфейс через `wg-quick` / `awg-quick` (если задан `config_path`).
-    pub async fn ensure_interface(&self) -> Result<()> {
+    pub async fn ensure_interface(&mut self) -> Result<()> {
+        if interface_is_up(&self.interface).await.is_ok() {
+            return Ok(());
+        }
         if let Some(path) = &self.config_path {
             info!(config = %path.display(), "{} up", self.quick_binary);
             run_command(self.quick_binary, "up", path).await?;
+            self.started = true;
             info!(interface = %path.file_stem().and_then(|s| s.to_str()).unwrap_or("wg"), "интерфейс поднят");
         }
         Ok(())
@@ -147,6 +155,9 @@ impl ServerInterface {
 
     /// Опускает интерфейс через `wg-quick` / `awg-quick` (если был поднят оркестратором).
     pub async fn teardown(&self) -> Result<()> {
+        if !self.started {
+            return Ok(());
+        }
         if let Some(path) = &self.config_path {
             info!(config = %path.display(), "{} down", self.quick_binary);
             run_command(self.quick_binary, "down", path).await?;

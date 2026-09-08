@@ -2,15 +2,16 @@
 FROM rust:1-alpine AS builder
 
 WORKDIR /build
+RUN apk add --no-cache musl-dev
 
 # Кэшируем зависимости
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo "fn main() {}" > src/main.rs && \
-    cargo build --release && rm -rf src
+    cargo build --release --locked && rm -rf src
 
 # Копируем исходники и собираем бинарник
 COPY src/ src/
-RUN touch src/main.rs && cargo build --release
+RUN touch src/main.rs && cargo build --release --locked
 
 # ── Stage 2: рантайм ────────────────────────────────────────
 FROM alpine:3.24
@@ -34,7 +35,8 @@ RUN apk add --no-cache git make gcc musl-dev linux-headers bash \
     && apk del git make gcc musl-dev
 
 # Xray (Go — статическая линковка, работает на musl)
-RUN curl -fsSL https://github.com/XTLS/Xray-core/releases/latest/download/xray-linux-64.zip -o /tmp/xray.zip \
+RUN test "$(apk --print-arch)" = x86_64 \
+    && curl -fsSL "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip" -o /tmp/xray.zip \
     && unzip /tmp/xray.zip -d /usr/local/bin xray \
     && chmod +x /usr/local/bin/xray \
     && rm /tmp/xray.zip
@@ -42,7 +44,7 @@ RUN curl -fsSL https://github.com/XTLS/Xray-core/releases/latest/download/xray-l
 COPY --from=builder /build/target/release/vpn-orchestrator /usr/local/bin/vpn-orchestrator
 
 # busybox resolvconf падает при вызове из awg-quick/wg-quick.
-# Ставим заглушку в /usr/local/sbin (первый в PATH).
+# Ставим заглушку вместо системного resolvconf.
 RUN printf '#!/bin/sh\nexit 0\n' > /usr/bin/resolvconf && \
     chmod +x /usr/bin/resolvconf
 

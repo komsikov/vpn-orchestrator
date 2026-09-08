@@ -14,8 +14,10 @@ listen_port = 51820
 
 # === Upstream VPN — список в порядке приоритета ===
 # Первый здоровый upstream становится активным.
-# При недоступности активного — автоматический failover на следующий.
-# enabled = false — игнорируется (не запускается, не участвует в failover).
+# При недоступности активного — failover на следующий.
+# Если недоступны все — прямой выход через default route из main, затем возврат на VPN.
+# enabled = false — не запускается, не проверяется, не попадает в метрики.
+# Изменение конфига применяется после перезапуска сервиса.
 
 # Primary: WireGuard
 # [[upstream]]
@@ -34,7 +36,7 @@ listen_port = 51820
 name = "play2go"
 type = "amneziawg"
 interface = "awg0"
-config_path = "/etc/amnezia/play2go.conf"
+config_path = "/etc/amnezia/awg0.conf"
 enabled = true
 health_check_interval = 10
 health_check_target = "1.1.1.1"
@@ -45,7 +47,7 @@ failover_threshold = 3
 name = "play2go-lowcost"
 type = "amneziawg"
 interface = "awg1"
-config_path = "/etc/amnezia/play2go-lowcost.conf"
+config_path = "/etc/amnezia/awg1.conf"
 health_check_interval = 10
 health_check_target = "1.1.1.1"
 health_check_timeout = 3
@@ -65,7 +67,8 @@ failover_threshold = 3
 [routing]
 enable_ip_forward = true
 route_table = 100
-# Дополнительные префиксы, маршрутизируемые через upstream
+# Таблицы 100–102 зарезервированы для клиентов и проб двух включённых upstream.
+# Дополнительные маршруты внутри клиентской таблицы (источники: server.subnet)
 extra_prefixes = []
 
 [nat]
@@ -78,11 +81,12 @@ use_nftables = true
 # если активный upstream ниже порога.
 
 [speed_test]
-enabled = true
+# По умолчанию выключен: каждая проба скачивает файл через каждый upstream.
+enabled = false
 url = "https://speed.cloudflare.com/__down?bytes=10000000"  # 10 MB
 interval = 300          # секунды между замерами
 timeout = 30            # таймаут загрузки (секунды)
-min_mbps = 5.0          # порог переключения (0 = только логирование)
+min_mbps = 0.0          # порог переключения (0 = только логирование)
 
 # === Логирование ===
 # По умолчанию логи идут в stdout.
@@ -98,3 +102,43 @@ file = "/var/log/vpn-orchestrator.log"
 level = "info"
 max_size_mb = 10            # ротация при превышении (0 = без лимита)
 keep_mb = 1                 # сколько МБ оставить при ротации
+
+# === Расширенный мониторинг (полный пример и scoring-поля — в README) ===
+[monitoring]
+enabled = false
+health_targets = ["1.1.1.1", "8.8.8.8"]
+health_interval = 15
+health_timeout = 2
+health_probe_count = 5
+https_enabled = true
+https_targets = ["https://1.1.1.1"]
+https_interval = 60
+https_timeout = 10
+ewma_alpha = 0.2
+history_size = 1000
+quality_enabled = false
+quality_url = "https://speed.cloudflare.com/__down?bytes=5000000"
+quality_interval = 300
+quality_timeout = 30
+prometheus_enabled = false
+prometheus_port = 9099
+
+[monitoring.selector]
+enabled = false
+minimum_advantage = 0.10
+consecutive_wins = 3
+minimum_hold_secs = 180
+cooldown_secs = 300
+
+[monitoring.scoring]
+availability_weight = 0.35
+latency_weight = 0.25
+loss_weight = 0.15
+jitter_weight = 0.15
+http_weight = 0.10
+latency_max_ms = 500.0
+jitter_max_ms = 20.0
+healthy_threshold = 75.0
+degraded_threshold = 40.0
+fast_weight = 0.90
+historical_weight = 0.10

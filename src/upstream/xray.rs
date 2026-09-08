@@ -82,6 +82,7 @@ impl XrayUpstream {
         };
 
         let mut child = Command::new("xray")
+            .kill_on_drop(true)
             .arg("run")
             .arg("-config")
             .arg(config_path)

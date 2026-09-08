@@ -8,6 +8,7 @@
 //! оркестратор.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -27,6 +28,7 @@ pub struct WgUpstream {
     health_timeout: u64,
     health_check_interval: u64,
     failover_threshold: u32,
+    started: AtomicBool,
 }
 
 impl WgUpstream {
@@ -40,6 +42,7 @@ impl WgUpstream {
             health_timeout: config.health_check_timeout,
             health_check_interval: config.health_check_interval,
             failover_threshold: config.failover_threshold,
+            started: AtomicBool::new(false),
         })
     }
 
@@ -70,17 +73,21 @@ impl WgUpstream {
             );
         };
         run_wg_quick(self.quick_binary, "up", path).await?;
+        self.started.store(true, Ordering::Relaxed);
+        interface_is_up(&self.interface).await?;
         info!(upstream = %self.name, interface = %self.interface, "upstream поднят");
         Ok(())
     }
 
     pub async fn stop(&self) -> Result<()> {
+        if !self.started.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         let Some(path) = &self.config_path else {
             return Ok(());
         };
-        if let Err(e) = run_wg_quick(self.quick_binary, "down", path).await {
-            tracing::warn!(upstream = %self.name, error = %e, "ошибка остановки");
-        }
+        run_wg_quick(self.quick_binary, "down", path).await?;
+        self.started.store(false, Ordering::Relaxed);
         Ok(())
     }
 

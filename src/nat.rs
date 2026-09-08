@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use tokio::process::Command;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -19,7 +19,10 @@ pub struct NatConfig {
 
 impl Default for NatConfig {
     fn default() -> Self {
-        Self { masquerade: true, use_nftables: true }
+        Self {
+            masquerade: true,
+            use_nftables: true,
+        }
     }
 }
 
@@ -32,6 +35,7 @@ pub struct NatSetup {
     upstream_interface: String,
     server_subnet: String,
     use_nftables: bool,
+    masquerade: bool,
 }
 
 impl NatSetup {
@@ -52,6 +56,7 @@ impl NatSetup {
             upstream_interface: upstream_interface.to_string(),
             server_subnet: server_subnet.to_string(),
             use_nftables,
+            masquerade,
         };
 
         if !masquerade {
@@ -60,10 +65,9 @@ impl NatSetup {
 
         setup.remove_rules().await;
 
-        if use_nftables {
-            setup.apply_nftables().await?;
-        } else {
-            setup.apply_iptables().await?;
+        if let Err(error) = setup.apply_rules().await {
+            setup.remove_rules().await;
+            return Err(error);
         }
 
         info!(
@@ -78,17 +82,34 @@ impl NatSetup {
 
     /// Переключает NAT на новый upstream-интерфейс (при failover).
     pub async fn switch_interface(&mut self, new_upstream: &str) -> Result<()> {
+        if !self.masquerade {
+            return Ok(());
+        }
+        let previous = self.upstream_interface.clone();
         self.remove_rules().await;
         self.upstream_interface = new_upstream.to_string();
 
-        if self.use_nftables {
-            self.apply_nftables().await?;
-        } else {
-            self.apply_iptables().await?;
+        if let Err(error) = self.apply_rules().await {
+            self.remove_rules().await;
+            self.upstream_interface = previous;
+            if let Err(rollback) = self.apply_rules().await {
+                return Err(
+                    error.context(format!("восстановление NAT также не удалось: {rollback}"))
+                );
+            }
+            return Err(error);
         }
 
         info!(upstream = new_upstream, "NAT переключён на новый upstream");
         Ok(())
+    }
+
+    async fn apply_rules(&self) -> Result<()> {
+        if self.use_nftables {
+            self.apply_nftables().await
+        } else {
+            self.apply_iptables().await
+        }
     }
 
     async fn apply_nftables(&self) -> Result<()> {
@@ -109,15 +130,16 @@ impl NatSetup {
         );
 
         for rule in &rules {
-            if let Err(e) = run_iptables(rule).await {
-                warn!(error = %e, args = ?rule, "iptables rule");
-            }
+            run_iptables(rule).await?;
         }
 
         Ok(())
     }
 
     async fn remove_rules(&self) {
+        if !self.masquerade {
+            return;
+        }
         if self.use_nftables {
             if let Err(e) = nft_delete_table().await {
                 debug!(error = %e, "nft table не найдена (нормально при первом старте)");
@@ -262,6 +284,16 @@ async fn run_iptables(args: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn disabled_nat_stays_disabled_after_switch_and_cleanup() {
+        let mut nat = NatSetup::apply("wg0", "wg1", "10.8.0.0/24", true, false)
+            .await
+            .unwrap();
+        nat.switch_interface("wg2").await.unwrap();
+        nat.cleanup().await.unwrap();
+        assert!(!nat.masquerade);
+    }
 
     #[test]
     fn nftables_script_contains_all_rules() {
