@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use tokio::process::Command;
+use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
@@ -233,6 +234,13 @@ impl IcmpResult {
 
 pub(crate) struct HttpsResult {
     pub(crate) success: bool,
+    pub(crate) error: Option<String>,
+}
+
+pub(crate) struct HttpsProbeOutcome {
+    vpn_index: usize,
+    target: String,
+    result: Result<HttpsResult>,
 }
 
 pub(crate) struct QualityResult {
@@ -531,8 +539,8 @@ pub(crate) async fn https_probe(
             "*",
             "--interface",
             &format!("if!{interface}"),
-            "--fail",
-            "-s",
+            "--head",
+            "-sS",
             "-o",
             "/dev/null",
             "-w",
@@ -545,14 +553,23 @@ pub(crate) async fn https_probe(
         .await
         .with_context(|| format!("curl https probe via {interface}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let success = output.status.success()
-        && stdout
-            .trim()
-            .parse::<u16>()
-            .ok()
-            .map(|c| (200..400).contains(&c))
-            .unwrap_or(false);
-    Ok(HttpsResult { success })
+    let status_code = stdout.trim().parse::<u16>().ok();
+    // 4xx подтверждает, что DNS, TLS и маршрут до сервиса работают. Такие ответы
+    // типичны для URL, требующих браузерной сессии (например, ChatGPT), и не
+    // означают недоступность VPN.
+    let success =
+        output.status.success() && status_code.is_some_and(|code| (200..500).contains(&code));
+    let error = (!success).then(|| {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        if !stderr.is_empty() {
+            stderr
+        } else if let Some(code) = status_code {
+            format!("HTTP {code}")
+        } else {
+            format!("curl завершился с exit status: {}", output.status)
+        }
+    });
+    Ok(HttpsResult { success, error })
 }
 
 pub(crate) async fn quality_probe(
@@ -571,7 +588,7 @@ pub(crate) async fn quality_probe(
             "--interface",
             &format!("if!{interface}"),
             "--fail",
-            "-s",
+            "-sS",
             "-o",
             "/dev/null",
             "-w",
@@ -583,12 +600,12 @@ pub(crate) async fn quality_probe(
         .output()
         .await
         .with_context(|| format!("quality probe via {interface}"))?;
-    if !output.status.success() {
-        return Ok(QualityResult {
-            success: false,
-            mbps: 0.0,
-        });
-    }
+    anyhow::ensure!(
+        output.status.success(),
+        "curl завершился с {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
     let bytes_per_sec: f64 = String::from_utf8_lossy(&output.stdout)
         .trim()
         .parse()
@@ -808,6 +825,11 @@ impl Monitor {
     pub(crate) fn health_interval_secs(&self) -> u64 {
         self.config.health_interval
     }
+    pub(crate) fn is_unhealthy(&self, index: usize) -> bool {
+        self.metrics
+            .get(index)
+            .is_some_and(|metric| metric.state == VpnState::Unhealthy)
+    }
 
     pub(crate) fn snapshot(&self, active_idx: Option<usize>) -> Vec<VpnSnapshot> {
         self.metrics
@@ -832,20 +854,19 @@ impl Monitor {
             .collect()
     }
 
+    pub(crate) fn https_enabled(&self) -> bool {
+        self.config.https_enabled
+    }
+
+    pub(crate) fn https_interval_secs(&self) -> u64 {
+        self.config.https_interval
+    }
+
     pub(crate) async fn probe_cycle(
         &mut self,
-        last_https: &mut Option<Instant>,
         last_quality: &mut Option<Instant>,
     ) -> Option<SwitchDecision> {
-        if self.config.https_enabled {
-            let due = last_https
-                .map(|t| t.elapsed() >= Duration::from_secs(self.config.https_interval))
-                .unwrap_or(true);
-            if due {
-                self.run_https_probes().await;
-                *last_https = Some(Instant::now());
-            }
-        }
+        let decision = self.run_health_probes().await;
         if self.config.quality_enabled {
             let due = last_quality
                 .map(|t| t.elapsed() >= Duration::from_secs(self.config.quality_interval))
@@ -855,7 +876,7 @@ impl Monitor {
                 *last_quality = Some(Instant::now());
             }
         }
-        self.run_health_probes().await
+        decision
     }
 
     async fn run_health_probes(&mut self) -> Option<SwitchDecision> {
@@ -937,46 +958,88 @@ impl Monitor {
                 (i, m.name.as_str(), score, m.state)
             })
             .collect();
+        let summary = scores
+            .iter()
+            .map(|(_, name, score, state)| format!("{name}={score:.1}({state})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        debug!(scores = %summary, "score upstream-ов за цикл мониторинга");
         self.selector.evaluate(&scores)
     }
 
-    async fn run_https_probes(&mut self) {
+    pub(crate) fn start_https_probes(&self) -> JoinHandle<Vec<HttpsProbeOutcome>> {
         let targets = self.config.https_targets.clone();
         let timeout = self.config.https_timeout;
-        let history_size = self.config.history_size;
-        for vpn in &mut self.metrics {
-            let mut failed = 0;
-            for target in &targets {
-                match https_probe(&vpn.interface, target, timeout).await {
-                    Ok(result) => {
-                        if !result.success {
-                            failed += 1;
-                            debug!(vpn = %vpn.name, interface = %vpn.interface, target = target, "https probe failed");
-                        }
-                        vpn.add_https_sample(
-                            HttpsSample {
-                                timestamp: Instant::now(),
-                                success: result.success,
-                            },
-                            history_size,
-                        );
+        let requests = self
+            .metrics
+            .iter()
+            .enumerate()
+            .flat_map(|(vpn_index, vpn)| {
+                targets
+                    .iter()
+                    .cloned()
+                    .map(move |target| (vpn_index, vpn.interface.clone(), target))
+            })
+            .collect::<Vec<_>>();
+
+        tokio::spawn(async move {
+            let mut probes = JoinSet::new();
+            for (vpn_index, interface, target) in requests {
+                probes.spawn(async move {
+                    let result = https_probe(&interface, &target, timeout).await;
+                    HttpsProbeOutcome {
+                        vpn_index,
+                        target,
+                        result,
                     }
-                    Err(e) => {
-                        failed += 1;
-                        debug!(vpn = %vpn.name, interface = %vpn.interface, target = target, error = %e, "https probe error");
-                        vpn.add_https_sample(
-                            HttpsSample {
-                                timestamp: Instant::now(),
-                                success: false,
-                            },
-                            history_size,
-                        );
-                    }
+                });
+            }
+            let mut results = Vec::new();
+            while let Some(result) = probes.join_next().await {
+                if let Ok(outcome) = result {
+                    results.push(outcome);
                 }
             }
+            results
+        })
+    }
+
+    pub(crate) fn apply_https_probes(&mut self, outcomes: Vec<HttpsProbeOutcome>) {
+        let history_size = self.config.history_size;
+        let mut failed = vec![0; self.metrics.len()];
+        for outcome in outcomes {
+            let vpn = &mut self.metrics[outcome.vpn_index];
+            match outcome.result {
+                Ok(result) => {
+                    if !result.success {
+                        failed[outcome.vpn_index] += 1;
+                        debug!(vpn = %vpn.name, interface = %vpn.interface, target = outcome.target, error = ?result.error, "https probe failed");
+                    }
+                    vpn.add_https_sample(
+                        HttpsSample {
+                            timestamp: Instant::now(),
+                            success: result.success,
+                        },
+                        history_size,
+                    );
+                }
+                Err(e) => {
+                    failed[outcome.vpn_index] += 1;
+                    debug!(vpn = %vpn.name, interface = %vpn.interface, target = outcome.target, error = %e, "https probe error");
+                    vpn.add_https_sample(
+                        HttpsSample {
+                            timestamp: Instant::now(),
+                            success: false,
+                        },
+                        history_size,
+                    );
+                }
+            }
+        }
+        for (vpn, failed) in self.metrics.iter_mut().zip(failed) {
             if vpn.last_https_failed != Some(failed) {
                 if failed > 0 {
-                    warn!(event = "https_probe_failed", vpn = %vpn.name, failed_targets = failed, total_targets = targets.len(), "HTTPS-пробы upstream не проходят");
+                    warn!(event = "https_probe_failed", vpn = %vpn.name, failed_targets = failed, total_targets = self.config.https_targets.len(), "HTTPS-пробы upstream не проходят");
                 } else if vpn.last_https_failed.is_some() {
                     info!(event = "https_probe_restored", vpn = %vpn.name, "HTTPS-доступ через upstream восстановлен");
                 }
@@ -1164,9 +1227,10 @@ mod tests {
         let mut config: Config = toml::from_str(include_str!("../config.example.toml")).unwrap();
         config.upstream[1].enabled = false;
         config.monitoring.quality_enabled = true;
+        config.speed_test.enabled = true;
         let monitor = Monitor::new(&config);
         assert_eq!(monitor.snapshot(None).len(), 1);
-        assert_eq!(monitor.snapshot(None)[0].name, "play2go");
+        assert_eq!(monitor.snapshot(None)[0].name, "primary-awg");
         assert!(!monitor.config.quality_enabled); // speed_test already downloads
         assert!(monitor.snapshot(None)[0].score.is_none()); // selector disabled
     }

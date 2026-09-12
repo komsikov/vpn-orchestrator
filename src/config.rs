@@ -57,6 +57,7 @@ impl Default for LoggingConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpstreamConfig {
     pub name: String,
     #[serde(rename = "type")]
@@ -363,6 +364,16 @@ mod tests {
         disabled.enabled = false;
         config.upstream.push(disabled);
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_misspelled_upstream_enabled() {
+        let config = toml::from_str::<Config>(
+            "[server]\ninterface='wg0'\nsubnet='10.8.0.0/24'\n\
+             [[upstream]]\nname='primary'\ntype='wireguard'\ninterface='wg1'\nenable=false",
+        );
+        assert!(config.is_err());
+        assert!(config.unwrap_err().to_string().contains("enable"));
     }
 
     #[test]

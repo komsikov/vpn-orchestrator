@@ -3,6 +3,10 @@
 **/*.rs.bk
 *.pdb
 
+# Python
+__pycache__/
+*.py[cod]
+
 # Cargo
 # Cargo.lock оставляем под VCS для бинарного crate
 

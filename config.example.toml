@@ -1,5 +1,6 @@
 # Пример конфигурации vpn-orchestrator
-# Скопируйте: cp config.example.toml /etc/vpn-orchestrator/config.toml
+# Шаблон: скопируйте его и замените интерфейсы, пути и upstream на свои.
+# Не запускайте файл без настройки серверного интерфейса и включённых upstream.
 
 [server]
 # Серверный VPN-интерфейс (принимает клиентов)
@@ -31,9 +32,9 @@ listen_port = 51820
 # health_check_timeout = 3         # таймаут ping (секунды)
 # failover_threshold = 3           # неудач подряд до переключения
 
-# Backup 1: AmneziaWG
+# Пример AmneziaWG: замените name и config_path на свои.
 [[upstream]]
-name = "play2go"
+name = "primary-awg"
 type = "amneziawg"
 interface = "awg0"
 config_path = "/etc/amnezia/awg0.conf"
@@ -44,7 +45,7 @@ health_check_timeout = 3
 failover_threshold = 3
 
 [[upstream]]
-name = "play2go-lowcost"
+name = "backup-awg"
 type = "amneziawg"
 interface = "awg1"
 config_path = "/etc/amnezia/awg1.conf"
@@ -111,7 +112,15 @@ health_interval = 15
 health_timeout = 2
 health_probe_count = 5
 https_enabled = true
-https_targets = ["https://1.1.1.1"]
+# Проверка доступности нужных сервисов через каждый upstream.
+# Все URL имеют одинаковый вес в HTTPS-score.
+https_targets = [
+  "https://www.youtube.com/generate_204",
+  "https://chatgpt.com/",
+  "https://www.instagram.com/",
+  "https://web.telegram.org/",
+  "https://1.1.1.1"
+]
 https_interval = 60
 https_timeout = 10
 ewma_alpha = 0.2

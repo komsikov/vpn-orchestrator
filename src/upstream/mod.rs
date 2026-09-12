@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 
+use tokio::task::JoinHandle;
 use tokio::time;
 use tracing::{debug, error, info, warn};
 
@@ -103,6 +104,13 @@ pub struct UpstreamManager {
     monitor: Option<Monitor>,
     shared_metrics: SharedMetrics,
     speed_test: SpeedTestConfig,
+    speed_task: Option<JoinHandle<Vec<SpeedMeasurement>>>,
+    https_task: Option<JoinHandle<Vec<monitor::HttpsProbeOutcome>>>,
+}
+
+struct SpeedMeasurement {
+    index: usize,
+    result: Result<monitor::QualityResult>,
 }
 
 impl UpstreamManager {
@@ -140,6 +148,8 @@ impl UpstreamManager {
             monitor,
             shared_metrics: shared_metrics.clone(),
             speed_test: config.speed_test.clone(),
+            speed_task: None,
+            https_task: None,
         };
 
         for i in 0..manager.upstreams.len() {
@@ -341,10 +351,34 @@ impl UpstreamManager {
     pub async fn monitor_loop(&mut self) {
         let mut last_health: Option<std::time::Instant> = None;
         let mut last_monitor: Option<std::time::Instant> = None;
-        let mut last_https = None;
+        let mut last_https: Option<std::time::Instant> = None;
         let mut last_quality = None;
         let mut last_speed: Option<std::time::Instant> = None;
         loop {
+            if self
+                .speed_task
+                .as_ref()
+                .is_some_and(JoinHandle::is_finished)
+            {
+                match self.speed_task.take().unwrap().await {
+                    Ok(measurements) => self.apply_speed_tests(measurements).await,
+                    Err(error) => error!(error = %error, "speed test task завершилась"),
+                }
+            }
+            if self
+                .https_task
+                .as_ref()
+                .is_some_and(JoinHandle::is_finished)
+            {
+                match self.https_task.take().unwrap().await {
+                    Ok(outcomes) => self
+                        .monitor
+                        .as_mut()
+                        .expect("HTTPS task requires monitor")
+                        .apply_https_probes(outcomes),
+                    Err(error) => error!(error = %error, "HTTPS-пробы task завершилась"),
+                }
+            }
             let health_interval = self
                 .active_index
                 .map(|i| self.upstreams[i].health_check_interval())
@@ -368,18 +402,33 @@ impl UpstreamManager {
                     .monitor
                     .as_mut()
                     .unwrap()
-                    .probe_cycle(&mut last_https, &mut last_quality)
+                    .probe_cycle(&mut last_quality)
                     .await;
                 if let Some(d) = decision {
                     self.handle_switch_decision(d).await;
                 }
                 last_monitor = Some(std::time::Instant::now());
             }
+            let https_due = self.monitor.as_ref().is_some_and(|m| {
+                m.https_enabled()
+                    && last_https
+                        .is_none_or(|t| t.elapsed() >= Duration::from_secs(m.https_interval_secs()))
+            });
+            if https_due && self.https_task.is_none() {
+                self.https_task = Some(
+                    self.monitor
+                        .as_ref()
+                        .expect("HTTPS task requires monitor")
+                        .start_https_probes(),
+                );
+                last_https = Some(std::time::Instant::now());
+            }
             if self.speed_test.enabled
+                && self.speed_task.is_none()
                 && last_speed
                     .is_none_or(|t| t.elapsed() >= Duration::from_secs(self.speed_test.interval))
             {
-                self.run_speed_tests().await;
+                self.start_speed_tests().await;
                 last_speed = Some(std::time::Instant::now());
             }
             self.publish_metrics();
@@ -387,27 +436,54 @@ impl UpstreamManager {
         }
     }
 
-    async fn run_speed_tests(&mut self) {
-        let mut speeds = vec![None; self.upstreams.len()];
-        for (i, speed) in speeds.iter_mut().enumerate() {
+    async fn start_speed_tests(&mut self) {
+        let mut interfaces = Vec::new();
+        for i in 0..self.upstreams.len() {
+            if self
+                .monitor
+                .as_ref()
+                .is_some_and(|monitor| monitor.is_unhealthy(i))
+            {
+                debug!(
+                    upstream = self.upstreams[i].name(),
+                    "speed test пропущен: upstream UNHEALTHY"
+                );
+                continue;
+            }
             if let Err(e) = self.start_upstream(i).await {
                 warn!(upstream = self.upstreams[i].name(), error = %e, "speed test: upstream недоступен");
                 continue;
             }
-            let upstream = &self.upstreams[i];
-            match monitor::quality_probe(
-                upstream.interface(),
-                &self.speed_test.url,
-                self.speed_test.timeout,
-            )
-            .await
-            {
+            interfaces.push((i, self.upstreams[i].interface().to_string()));
+        }
+        let url = self.speed_test.url.clone();
+        let timeout = self.speed_test.timeout;
+        self.speed_task = Some(tokio::spawn(async move {
+            let mut measurements = Vec::with_capacity(interfaces.len());
+            for (index, interface) in interfaces {
+                measurements.push(SpeedMeasurement {
+                    index,
+                    result: monitor::quality_probe(&interface, &url, timeout).await,
+                });
+            }
+            measurements
+        }));
+    }
+
+    async fn apply_speed_tests(&mut self, measurements: Vec<SpeedMeasurement>) {
+        let mut speeds = vec![None; self.upstreams.len()];
+        for measurement in measurements {
+            let upstream = &self.upstreams[measurement.index];
+            match measurement.result {
                 Ok(result) if result.success => {
-                    *speed = Some(result.mbps);
+                    speeds[measurement.index] = Some(result.mbps);
                     info!(upstream = upstream.name(), mbps = result.mbps, "speed test");
                 }
-                result => {
-                    warn!(upstream = upstream.name(), error = ?result.err(), "speed test failed");
+                Ok(_) => {
+                    warn!(upstream = upstream.name(), "speed test не вернул скорость");
+                }
+                Err(error) => {
+                    warn!(upstream = upstream.name(), error = %error, "speed test failed");
                 }
             }
         }
@@ -547,6 +623,12 @@ impl UpstreamManager {
     }
 
     pub async fn shutdown(&mut self) {
+        if let Some(task) = self.speed_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.https_task.take() {
+            task.abort();
+        }
         if let Some(nat) = self.nat.take() {
             if let Err(e) = nat.cleanup().await {
                 error!(error = %e, "ошибка очистки NAT");

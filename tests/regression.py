@@ -14,7 +14,7 @@ import unittest
 
 BINARY = Path(__file__).resolve().parents[1] / "target/debug/vpn-orchestrator"
 FAKE = r'''
-import json, os, sys
+import json, os, sys, time
 from pathlib import Path
 root = Path(os.environ["VPN_TEST_ROOT"])
 name, args = Path(sys.argv[0]).name, sys.argv[1:]
@@ -48,10 +48,14 @@ elif name == "ping":
     sys.exit(1 if down else 0)
 elif name == "curl":
     if "%{speed_download}" in args:
+        if (root / "slow-speed-test").exists():
+            time.sleep(4)
         interface = args[args.index("--interface") + 1]
         print("250000" if interface == "if!wg1" else "1250000")
     else:
-        print("200")
+        if (root / "slow-https-probe").exists():
+            time.sleep(4)
+        print("403" if (root / "https-forbidden").exists() else "200")
     sys.exit(28 if (root / "curl-fail").exists() else 0)
 elif name == "nft":
     if "-f" in args:
@@ -166,6 +170,42 @@ class LifecycleTests(unittest.TestCase):
         self.assertIn("--noproxy", curl)
         self.assertIn("--fail", curl)
         self.assertIn("if!wg1", curl)
+
+    def test_health_check_is_not_blocked_by_speed_test(self):
+        (self.root / "slow-speed-test").touch()
+        self.start(extra='[speed_test]\nenabled=true\ninterval=1\ntimeout=10')
+        self.wait_for(lambda: self.selected("wg1"))
+        (self.root / "wg1-down").touch()
+        self.wait_for(lambda: self.selected("wg2"), timeout=3)
+
+    def test_health_check_is_not_blocked_by_https_probes(self):
+        (self.root / "slow-https-probe").touch()
+        self.start(extra='[monitoring]\nenabled=true\nhealth_interval=1\nhealth_probe_count=1\nhttps_enabled=true\nhttps_targets=["https://one.invalid/", "https://two.invalid/"]\nhttps_interval=1\nhttps_timeout=10')
+        self.wait_for(lambda: self.selected("wg1"))
+        (self.root / "wg1-down").touch()
+        self.wait_for(lambda: self.selected("wg2"), timeout=3)
+
+    def test_https_probe_accepts_reachable_403(self):
+        (self.root / "https-forbidden").touch()
+        self.start(extra='[monitoring]\nenabled=true\nhealth_interval=1\nhealth_probe_count=1\nhttps_enabled=true\nhttps_targets=["https://chatgpt.com/"]\nhttps_interval=1')
+        self.wait_for(lambda: any(c[0] == "curl" and "%{http_code}" in c for c in self.commands()))
+        self.wait_for(lambda: "https_probe_failed" not in (self.root / "output").read_text(), timeout=2)
+        https_curl = next(c for c in self.commands() if c[0] == "curl" and "%{http_code}" in c)
+        self.assertNotIn("--fail", https_curl)
+        self.assertIn("--head", https_curl)
+
+    def test_speed_test_skips_monitor_unhealthy_upstream(self):
+        (self.root / "wg2-down").touch()
+        self.start(extra='[monitoring]\nenabled=true\nhealth_interval=1\nhealth_probe_count=1\nhttps_enabled=false\n[speed_test]\nenabled=true\ninterval=1\ntimeout=1')
+        self.wait_for(lambda: "upstream_unhealthy" in (self.root / "output").read_text())
+        self.wait_for(lambda: any(c[0] == "curl" and "if!wg1" in c for c in self.commands()))
+        self.assertFalse(any(c[0] == "curl" and "if!wg2" in c for c in self.commands()))
+
+    def test_speed_test_logs_curl_error(self):
+        (self.root / "curl-fail").touch()
+        self.start(extra='[speed_test]\nenabled=true\ninterval=1\ntimeout=1')
+        self.wait_for(lambda: "speed test failed" in (self.root / "output").read_text())
+        self.assertIn("curl завершился с", (self.root / "output").read_text())
 
     def test_route_error_is_fatal_and_cleans_managed_server(self):
         (self.root / "server-down").touch()
