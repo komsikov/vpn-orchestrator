@@ -104,6 +104,8 @@ pub struct UpstreamManager {
     monitor: Option<Monitor>,
     shared_metrics: SharedMetrics,
     speed_test: SpeedTestConfig,
+    speed_selector: monitor::Selector,
+    health_task: Option<JoinHandle<Vec<monitor::HealthProbeOutcome>>>,
     speed_task: Option<JoinHandle<Vec<SpeedMeasurement>>>,
     https_task: Option<JoinHandle<Vec<monitor::HttpsProbeOutcome>>>,
 }
@@ -147,7 +149,25 @@ impl UpstreamManager {
             last_outage_log: None,
             monitor,
             shared_metrics: shared_metrics.clone(),
-            speed_test: config.speed_test.clone(),
+            speed_test: if !config.speed_test.enabled
+                && config.monitoring.enabled
+                && config.monitoring.quality_enabled
+            {
+                SpeedTestConfig {
+                    enabled: true,
+                    url: config.monitoring.quality_url.clone(),
+                    interval: config.monitoring.quality_interval,
+                    timeout: config.monitoring.quality_timeout,
+                    min_mbps: 0.0,
+                }
+            } else {
+                config.speed_test.clone()
+            },
+            speed_selector: monitor::Selector::new(monitor::SelectorConfig {
+                enabled: true,
+                ..config.monitoring.selector.clone()
+            }),
+            health_task: None,
             speed_task: None,
             https_task: None,
         };
@@ -200,12 +220,15 @@ impl UpstreamManager {
     }
 
     async fn select_initial(&mut self) -> Result<()> {
-        for (i, upstream) in self.upstreams.iter().enumerate() {
+        for i in 0..self.upstreams.len() {
+            let upstream = &self.upstreams[i];
             match upstream.health_check().await {
-                Ok(()) => {
-                    self.activate(i).await?;
-                    return Ok(());
-                }
+                Ok(()) => match self.activate(i).await {
+                    Ok(()) => return Ok(()),
+                    Err(error) => {
+                        warn!(error = %error, "начальная активация не удалась; пробуем следующий upstream")
+                    }
+                },
                 Err(e) => {
                     warn!(upstream = upstream.name(), error = %e, "health check не прошёл");
                 }
@@ -276,6 +299,7 @@ impl UpstreamManager {
         })
         .await?;
         self.active_index = Some(index);
+        self.speed_selector.set_active(index);
         self.direct_fallback = false;
         self.failure_count = 0;
         if let Some(m) = &mut self.monitor {
@@ -292,6 +316,7 @@ impl UpstreamManager {
 
     async fn enter_outage(&mut self) {
         self.active_index = None;
+        self.speed_selector.clear_active();
         if let Some(m) = &mut self.monitor {
             m.clear_selector_active();
         }
@@ -352,7 +377,6 @@ impl UpstreamManager {
         let mut last_health: Option<std::time::Instant> = None;
         let mut last_monitor: Option<std::time::Instant> = None;
         let mut last_https: Option<std::time::Instant> = None;
-        let mut last_quality = None;
         let mut last_speed: Option<std::time::Instant> = None;
         loop {
             if self
@@ -391,22 +415,29 @@ impl UpstreamManager {
                 last_monitor
                     .is_none_or(|t| t.elapsed() >= Duration::from_secs(m.health_interval_secs()))
             });
-            if monitor_due {
-                // Восстанавливаем остановленные интерфейсы и дочерние процессы до проб.
+            if self
+                .health_task
+                .as_ref()
+                .is_some_and(JoinHandle::is_finished)
+            {
+                match self.health_task.take().unwrap().await {
+                    Ok(outcomes) => {
+                        if let Some(decision) =
+                            self.monitor.as_mut().unwrap().apply_health_probes(outcomes)
+                        {
+                            self.handle_switch_decision(decision).await;
+                        }
+                    }
+                    Err(error) => error!(error = %error, "ICMP task завершилась"),
+                }
+            }
+            if monitor_due && self.health_task.is_none() {
                 for i in 0..self.upstreams.len() {
                     if let Err(e) = self.start_upstream(i).await {
                         warn!(upstream = self.upstreams[i].name(), error = %e, "восстановление upstream не удалось");
                     }
                 }
-                let decision = self
-                    .monitor
-                    .as_mut()
-                    .unwrap()
-                    .probe_cycle(&mut last_quality)
-                    .await;
-                if let Some(d) = decision {
-                    self.handle_switch_decision(d).await;
-                }
+                self.health_task = Some(self.monitor.as_ref().unwrap().start_health_probes());
                 last_monitor = Some(std::time::Instant::now());
             }
             let https_due = self.monitor.as_ref().is_some_and(|m| {
@@ -424,6 +455,7 @@ impl UpstreamManager {
                 last_https = Some(std::time::Instant::now());
             }
             if self.speed_test.enabled
+                && self.monitor.as_ref().is_none_or(|m| m.has_health_results())
                 && self.speed_task.is_none()
                 && last_speed
                     .is_none_or(|t| t.elapsed() >= Duration::from_secs(self.speed_test.interval))
@@ -493,12 +525,26 @@ impl UpstreamManager {
             }
         }
         if let Some(active) = self.active_index {
-            if let Some(candidate) = speed_candidate(&speeds, active, self.speed_test.min_mbps) {
-                if self.upstreams[candidate].health_check().await.is_ok() {
-                    if let Err(e) = self.activate(candidate).await {
-                        error!(error = %e, "speed switch failed");
-                    }
-                }
+            let eligible = speed_candidate(&speeds, active, self.speed_test.min_mbps);
+            let scores: Vec<_> = speeds
+                .iter()
+                .enumerate()
+                .filter_map(|(i, speed)| {
+                    speed.map(|speed| {
+                        (
+                            i,
+                            self.upstreams[i].name(),
+                            speed,
+                            monitor::VpnState::Healthy,
+                        )
+                    })
+                })
+                .collect();
+            if eligible.is_none() {
+                self.speed_selector.set_active(active); // reset consecutive speed wins
+            } else if let Some(decision) = self.speed_selector.evaluate(&scores) {
+                info!(from = %decision.from_name, to = %decision.to_name, "speed test: подтверждён кандидат на переключение");
+                self.handle_switch_decision(decision).await;
             }
         }
     }
@@ -623,6 +669,9 @@ impl UpstreamManager {
     }
 
     pub async fn shutdown(&mut self) {
+        if let Some(task) = self.health_task.take() {
+            task.abort();
+        }
         if let Some(task) = self.speed_task.take() {
             task.abort();
         }

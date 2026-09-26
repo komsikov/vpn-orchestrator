@@ -260,7 +260,11 @@ impl Config {
                     && (s.degraded_threshold..=100.0).contains(&s.healthy_threshold),
                 "monitoring.scoring: 0 <= degraded_threshold <= healthy_threshold <= 100"
             );
-            anyhow::ensure!(m.selector.minimum_advantage.is_finite() && m.selector.minimum_advantage >= 0.0 && m.selector.consecutive_wins > 0, "monitoring.selector: нужны неотрицательный minimum_advantage и положительный consecutive_wins");
+        }
+        if self.monitoring.enabled || (self.speed_test.enabled && self.speed_test.min_mbps > 0.0) {
+            let selector = &self.monitoring.selector;
+            anyhow::ensure!(selector.minimum_advantage.is_finite() && selector.minimum_advantage >= 0.0 && selector.consecutive_wins > 0,
+                "monitoring.selector: нужны неотрицательный minimum_advantage и положительный consecutive_wins");
         }
         Ok(())
     }
@@ -355,6 +359,15 @@ mod tests {
             change(&mut config);
             assert!(config.validate().is_err(), "{config:?}");
         }
+    }
+
+    #[test]
+    fn speed_switch_validates_selector_without_monitoring() {
+        let mut config = minimal_config();
+        config.speed_test.enabled = true;
+        config.speed_test.min_mbps = 5.0;
+        config.monitoring.selector.consecutive_wins = 0;
+        assert!(config.validate().is_err());
     }
 
     #[test]

@@ -72,6 +72,9 @@ impl WgUpstream {
                 self.interface
             );
         };
+        if crate::util::restore_existing_interface(&self.interface).await? {
+            return Ok(());
+        }
         run_wg_quick(self.quick_binary, "up", path).await?;
         self.started.store(true, Ordering::Relaxed);
         interface_is_up(&self.interface).await?;

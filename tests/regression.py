@@ -27,6 +27,11 @@ if fail.exists() and fail.read_text() in " ".join([name, *args]):
 if name == "ip":
     if args[:3] == ["link", "show", "wg0"] and (root / "server-down").exists():
         sys.exit(1)
+    if args[:2] == ["link", "show"] and (root / (args[2] + "-link-down")).exists():
+        print("5: test: <POINTOPOINT,NOARP> mtu 1420 state DOWN")
+        sys.exit(0)
+    if args[:3] == ["link", "set", "dev"]:
+        (root / (args[3] + "-link-down")).unlink(missing_ok=True)
     if args[:2] == ["link", "show"]:
         print("5: test: <POINTOPOINT,NOARP,UP> mtu 1420 state UNKNOWN")
     elif args[:3] == ["-4", "-o", "addr"]:
@@ -41,17 +46,23 @@ elif name in ("wg-quick", "awg-quick"):
         (root / "server-down").unlink(missing_ok=True)
 elif name == "ping":
     interface = args[args.index("-I") + 1]
-    down = (root / (interface + "-down")).exists()
+    if "-i" in args and (root / "slow-icmp-probe").exists():
+        time.sleep(4)
+    down = (root / (interface + "-down")).exists() or (root / (interface + "-link-down")).exists()
     if not down:
         print("64 bytes from 1.1.1.1: time=10.0 ms")
     print("1 packets transmitted, 0 received, 100% packet loss" if down else "1 packets transmitted, 1 received, 0% packet loss")
     sys.exit(1 if down else 0)
 elif name == "curl":
-    if "%{speed_download}" in args:
+    if any("%{speed_download}" in arg for arg in args):
         if (root / "slow-speed-test").exists():
             time.sleep(4)
         interface = args[args.index("--interface") + 1]
+        print("302" if (root / "download-redirect").exists() else "200")
+        print("0" if (root / "download-redirect").exists() else "1000000")
         print("250000" if interface == "if!wg1" else "1250000")
+        print("application/octet-stream")
+        print("192.0.2.1\n0.01\n0.02\n0.03\n0.04\n1\nhttps://test.invalid/file")
     else:
         if (root / "slow-https-probe").exists():
             time.sleep(4)
@@ -164,7 +175,7 @@ class LifecycleTests(unittest.TestCase):
         self.wait_for(lambda: self.selected("wg2"))
 
     def test_speed_test_switches_to_faster_upstream(self):
-        self.start(extra='[speed_test]\nenabled=true\ninterval=1\ntimeout=1\nmin_mbps=5.0')
+        self.start(extra='[speed_test]\nenabled=true\ninterval=1\ntimeout=1\nmin_mbps=5.0\n[monitoring.selector]\nminimum_hold_secs=0\ncooldown_secs=0\nconsecutive_wins=1')
         self.wait_for(lambda: self.selected("wg2"))
         curl = next(c for c in self.commands() if c[0] == "curl")
         self.assertIn("--noproxy", curl)
@@ -207,11 +218,13 @@ class LifecycleTests(unittest.TestCase):
         self.wait_for(lambda: "speed test failed" in (self.root / "output").read_text())
         self.assertIn("curl завершился с", (self.root / "output").read_text())
 
-    def test_route_error_is_fatal_and_cleans_managed_server(self):
+    def test_route_error_tries_backup_and_cleans_managed_server(self):
         (self.root / "server-down").touch()
         (self.root / "fail-command").write_text("ip route replace default dev wg1 table 100")
         self.start(server=f'type="amneziawg"\nconfig_path="{self.root}/wg0.conf"')
-        self.assertNotEqual(self.process.wait(timeout=10), 0)
+        self.wait_for(lambda: self.selected("wg2"))
+        self.process.terminate()
+        self.assertEqual(self.process.wait(timeout=5), 0)
         self.assertIn(["awg-quick", "down", str(self.root / "wg0.conf")], self.commands())
         self.assertIn(["ip", "route", "flush", "table", "100"], self.commands())
         self.assertIn("injected command failure", (self.root / "output").read_text())
@@ -284,6 +297,50 @@ class LifecycleTests(unittest.TestCase):
         self.process.terminate()
         self.assertEqual(self.process.wait(timeout=5), 0)
         self.assertFalse(any("wg9" in " ".join(c) for c in self.commands()))
+
+    def test_quality_probe_does_not_block_failover(self):
+        (self.root / "slow-speed-test").touch()
+        self.start(extra='[monitoring]\nenabled=true\nhealth_interval=1\nhealth_probe_count=1\nhttps_enabled=false\nquality_enabled=true\nquality_timeout=10')
+        self.wait_for(lambda: any(c[0] == "curl" for c in self.commands()))
+        (self.root / "wg1-down").touch()
+        self.wait_for(lambda: self.selected("wg2"), timeout=3)
+
+    def test_slow_monitor_icmp_does_not_block_active_check(self):
+        (self.root / "slow-icmp-probe").touch()
+        self.start(extra='[monitoring]\nenabled=true\nhealth_interval=1\nhealth_probe_count=1\nhttps_enabled=false')
+        self.wait_for(lambda: any(c[0] == "ping" and "-i" in c for c in self.commands()))
+        (self.root / "wg1-down").touch()
+        self.wait_for(lambda: self.selected("wg2"), timeout=3)
+
+    def test_speed_respects_hold(self):
+        self.start(extra='[monitoring.selector]\nminimum_hold_secs=3600\ncooldown_secs=3600\n[speed_test]\nenabled=true\ninterval=1\ntimeout=1\nmin_mbps=5.0')
+        self.wait_for(lambda: (self.root / "output").read_text().count('speed test upstream="backup"') >= 3)
+        self.assertFalse(self.selected("wg2"))
+
+    def test_redirect_does_not_trigger_speed_switch(self):
+        (self.root / "download-redirect").touch()
+        self.start(extra='[speed_test]\nenabled=true\ninterval=1\ntimeout=1\nmin_mbps=5.0\n[monitoring.selector]\nminimum_hold_secs=0\ncooldown_secs=0\nconsecutive_wins=1')
+        self.wait_for(lambda: "expected HTTP 200, got 302" in (self.root / "output").read_text())
+        self.assertFalse(self.selected("wg2"))
+
+    def test_existing_down_server_is_restored_without_quick(self):
+        (self.root / "wg0-link-down").touch()
+        self.start(server=f'config_path="{self.root}/wg0.conf"')
+        self.wait_for(lambda: self.selected("wg1"))
+        self.assertIn(["ip", "link", "set", "dev", "wg0", "up"], self.commands())
+        self.assertFalse(any(c[0].endswith("quick") for c in self.commands()))
+
+    def test_existing_down_upstream_is_restored_without_quick(self):
+        original = globals()["CONFIG"]
+        globals()["CONFIG"] = CONFIG.replace('interface = "wg1"', f'interface = "wg1"\nconfig_path = "{self.root}/wg1.conf"')
+        try:
+            (self.root / "wg1-link-down").touch()
+            self.start()
+            self.wait_for(lambda: self.selected("wg1"))
+            self.assertIn(["ip", "link", "set", "dev", "wg1", "up"], self.commands())
+            self.assertFalse(any(c[0].endswith("quick") for c in self.commands()))
+        finally:
+            globals()["CONFIG"] = original
 
     def test_zero_cli_interval_is_rejected(self):
         result = subprocess.run([str(BINARY), "--monitor-interval", "0"], env=self.env, capture_output=True)

@@ -215,6 +215,10 @@ pub struct MetricsSnapshot {
 }
 pub type SharedMetrics = Arc<Mutex<MetricsSnapshot>>;
 
+pub(crate) struct HealthProbeOutcome {
+    results: Vec<(Instant, Result<IcmpResult>)>,
+}
+
 struct IcmpResult {
     success: bool,
     rtts_ms: Vec<f64>,
@@ -592,7 +596,7 @@ pub(crate) async fn quality_probe(
             "-o",
             "/dev/null",
             "-w",
-            "%{speed_download}",
+            "%{http_code}\n%{size_download}\n%{speed_download}\n%{content_type}\n%{remote_ip}\n%{time_namelookup}\n%{time_connect}\n%{time_appconnect}\n%{time_starttransfer}\n%{time_total}\n%{url_effective}",
             "--max-time",
             &timeout_str,
             url,
@@ -600,23 +604,48 @@ pub(crate) async fn quality_probe(
         .output()
         .await
         .with_context(|| format!("quality probe via {interface}"))?;
+    let summary = String::from_utf8_lossy(&output.stdout);
+    let fields: Vec<_> = summary.lines().collect();
+    let field = |index| fields.get(index).copied().unwrap_or("");
+    info!(interface, url, measurement = "single_connection_download",
+        http_code = field(0), bytes = field(1), bytes_per_sec = field(2),
+        content_type = field(3), remote_ip = field(4), dns_secs = field(5),
+        connect_secs = field(6), tls_secs = field(7), first_byte_secs = field(8),
+        total_secs = field(9), effective_url = field(10), exit_status = %output.status,
+        "download probe diagnostics");
     anyhow::ensure!(
         output.status.success(),
         "curl завершился с {}: {}",
         output.status,
         String::from_utf8_lossy(&output.stderr).trim()
     );
-    let bytes_per_sec: f64 = String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse()
-        .context("парсинг скорости из quality probe")?;
+    parse_quality_output(&summary)
+}
+
+fn parse_quality_output(output: &str) -> Result<QualityResult> {
+    let mut fields = output.lines();
+    let code: u16 = fields.next().context("missing HTTP status")?.parse()?;
+    let bytes: u64 = fields.next().context("missing download size")?.parse()?;
+    let speed: f64 = fields.next().context("missing download speed")?.parse()?;
+    let content_type = fields.next().unwrap_or("").to_ascii_lowercase();
+    anyhow::ensure!(code == 200, "download probe: expected HTTP 200, got {code}");
     anyhow::ensure!(
-        bytes_per_sec.is_finite() && bytes_per_sec >= 0.0,
+        bytes >= 100_000,
+        "download probe: response too small ({bytes} bytes)"
+    );
+    anyhow::ensure!(
+        !content_type.starts_with("text/")
+            && !content_type.contains("json")
+            && !content_type.contains("xml"),
+        "download probe: unexpected content type {content_type}"
+    );
+    anyhow::ensure!(
+        speed.is_finite() && speed > 0.0,
         "некорректная скорость загрузки"
     );
     Ok(QualityResult {
         success: true,
-        mbps: bytes_per_sec * 8.0 / 1_000_000.0,
+        mbps: speed * 8.0 / 1_000_000.0,
     })
 }
 
@@ -639,6 +668,13 @@ impl Selector {
             candidate: None,
             candidate_wins: 0,
         }
+    }
+
+    pub(crate) fn clear_active(&mut self) {
+        self.active = None;
+        self.active_since = None;
+        self.candidate = None;
+        self.candidate_wins = 0;
     }
 
     pub(crate) fn set_active(&mut self, idx: usize) {
@@ -809,9 +845,7 @@ impl Monitor {
         self.selector.set_active(idx);
     }
     pub(crate) fn clear_selector_active(&mut self) {
-        self.selector.active = None;
-        self.selector.candidate = None;
-        self.selector.candidate_wins = 0;
+        self.selector.clear_active();
     }
     pub(crate) fn record_speed(&mut self, index: usize, speed: Option<f64>) {
         self.metrics[index].quality_mbps = speed;
@@ -825,6 +859,10 @@ impl Monitor {
     pub(crate) fn health_interval_secs(&self) -> u64 {
         self.config.health_interval
     }
+    pub(crate) fn has_health_results(&self) -> bool {
+        self.metrics.iter().all(|m| m.probed_at.is_some())
+    }
+
     pub(crate) fn is_unhealthy(&self, index: usize) -> bool {
         self.metrics
             .get(index)
@@ -862,38 +900,43 @@ impl Monitor {
         self.config.https_interval
     }
 
-    pub(crate) async fn probe_cycle(
-        &mut self,
-        last_quality: &mut Option<Instant>,
-    ) -> Option<SwitchDecision> {
-        let decision = self.run_health_probes().await;
-        if self.config.quality_enabled {
-            let due = last_quality
-                .map(|t| t.elapsed() >= Duration::from_secs(self.config.quality_interval))
-                .unwrap_or(true);
-            if due {
-                self.run_quality_probes().await;
-                *last_quality = Some(Instant::now());
+    pub(crate) fn start_health_probes(&self) -> JoinHandle<Vec<HealthProbeOutcome>> {
+        let interfaces: Vec<_> = self.metrics.iter().map(|m| m.interface.clone()).collect();
+        let targets = self.config.health_targets.clone();
+        let count = self.config.health_probe_count;
+        let timeout = self.config.health_timeout;
+        // One subprocess at a time, off the active-channel failover loop.
+        tokio::spawn(async move {
+            let mut outcomes = Vec::new();
+            for interface in interfaces {
+                let mut results = Vec::new();
+                for target in &targets {
+                    let result = icmp_probe(&interface, target, count, timeout).await;
+                    results.push((Instant::now(), result));
+                }
+                outcomes.push(HealthProbeOutcome { results });
             }
-        }
-        decision
+            outcomes
+        })
     }
 
-    async fn run_health_probes(&mut self) -> Option<SwitchDecision> {
+    pub(crate) fn apply_health_probes(
+        &mut self,
+        outcomes: Vec<HealthProbeOutcome>,
+    ) -> Option<SwitchDecision> {
         let targets = self.config.health_targets.clone();
         let alpha = self.config.ewma_alpha;
         let history_size = self.config.history_size;
-        let probe_count = self.config.health_probe_count;
-        let timeout = self.config.health_timeout;
         let sc = self.scoring_config.clone();
 
-        for vpn in &mut self.metrics {
+        for (vpn, outcome) in self.metrics.iter_mut().zip(outcomes) {
+            let completed_at = outcome.results.last().map(|(at, _)| *at);
             let mut failed_targets = 0;
-            for target in &targets {
-                match icmp_probe(&vpn.interface, target, probe_count, timeout).await {
+            for (target, (timestamp, result)) in targets.iter().zip(outcome.results) {
+                match result {
                     Ok(result) => {
                         let sample = HealthSample {
-                            timestamp: Instant::now(),
+                            timestamp,
                             success: result.success,
                             rtt_ms: result.mean_rtt(),
                             loss_pct: Some(result.loss_pct),
@@ -914,7 +957,7 @@ impl Monitor {
                         failed_targets += 1;
                         vpn.add_health_sample(
                             HealthSample {
-                                timestamp: Instant::now(),
+                                timestamp,
                                 success: false,
                                 rtt_ms: None,
                                 loss_pct: Some(100.0),
@@ -935,6 +978,7 @@ impl Monitor {
                 });
             }
             vpn.update_state(targets.len(), failed_targets, &sc);
+            vpn.probed_at = completed_at;
 
             if vpn.state_changed() {
                 if vpn.state == VpnState::Unhealthy {
@@ -1045,26 +1089,6 @@ impl Monitor {
                 }
             }
             vpn.last_https_failed = Some(failed);
-        }
-    }
-
-    async fn run_quality_probes(&mut self) {
-        let url = self.config.quality_url.clone();
-        let timeout = self.config.quality_timeout;
-        for vpn in &mut self.metrics {
-            vpn.quality_mbps = None;
-            match quality_probe(&vpn.interface, &url, timeout).await {
-                Ok(result) if result.success => {
-                    vpn.quality_mbps = Some(result.mbps);
-                    info!(vpn = %vpn.name, interface = %vpn.interface, quality_mbps = format!("{:.2}", result.mbps), "quality probe");
-                }
-                Ok(_) => {
-                    warn!(vpn = %vpn.name, interface = %vpn.interface, "quality probe failed");
-                }
-                Err(e) => {
-                    warn!(vpn = %vpn.name, interface = %vpn.interface, error = %e, "quality probe error");
-                }
-            }
         }
     }
 }
@@ -1197,6 +1221,24 @@ const METRIC_DEFS: &[(&str, &str, &str, MetricFmt)] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn download_response_must_be_a_real_payload() {
+        let valid = "200\n1000000\n1250000\napplication/octet-stream";
+        assert_eq!(parse_quality_output(valid).unwrap().mbps, 10.0);
+        for invalid in [
+            "302\n1000000\n1250000\napplication/octet-stream",
+            "204\n0\n0\n",
+            "200\n0\n100\n",
+            "200\n99999\n100\n",
+            "200\n1000000\nNaN\n",
+            "200\n1000000\n0\n",
+            "200\n1000000\n100\ntext/html",
+            "200\n1000000\n100\napplication/json",
+        ] {
+            assert!(parse_quality_output(invalid).is_err(), "{invalid}");
+        }
+    }
 
     #[test]
     fn metrics_are_measurements_not_quality_guesses() {

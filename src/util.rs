@@ -20,6 +20,28 @@ pub async fn interface_is_up(name: &str) -> Result<()> {
     }
 }
 
+/// Restore an existing configured interface without recreating it or taking ownership.
+pub async fn restore_existing_interface(name: &str) -> Result<bool> {
+    let output = Command::new("ip")
+        .args(["link", "show", name])
+        .output()
+        .await?;
+    if !output.status.success() {
+        return Ok(false);
+    }
+    let output = Command::new("ip")
+        .args(["link", "set", "dev", name, "up"])
+        .output()
+        .await?;
+    anyhow::ensure!(
+        output.status.success(),
+        "ip link set {name} up: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    interface_is_up(name).await?;
+    Ok(true)
+}
+
 pub async fn ping_check(interface: &str, target: &str, timeout_secs: u64) -> Result<f64> {
     let timeout_str = timeout_secs.to_string();
     let output = Command::new("ping")

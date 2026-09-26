@@ -79,7 +79,9 @@ use_nftables = true
 # === Замер скорости upstream-ов ===
 # Периодически загружает тестовый файл через каждый upstream-интерфейс
 # и логирует скорость. При min_mbps > 0 — переключается на более быстрый,
-# если активный upstream ниже порога.
+# если активный upstream ниже порога. Защита от частых переключений задаётся
+# полями monitoring.selector (hold/cooldown/advantage/consecutive_wins),
+# даже когда selector.enabled = false. Замер — одно соединение до URL, не Speedtest Multi.
 
 [speed_test]
 # По умолчанию выключен: каждая проба скачивает файл через каждый upstream.

@@ -75,6 +75,9 @@ impl ServerInterface {
             return Ok(());
         }
         if let Some(path) = &self.config_path {
+            if crate::util::restore_existing_interface(&self.interface).await? {
+                return Ok(());
+            }
             info!(config = %path.display(), "{} up", self.quick_binary);
             run_command(self.quick_binary, "up", path).await?;
             self.started = true;
