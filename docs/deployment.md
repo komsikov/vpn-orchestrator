@@ -34,3 +34,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now vpn-orchestrator
 sudo systemctl status vpn-orchestrator
 ```
+
+## Веб-панель
+
+Для управления профилями устройств и исходящими туннелями установите панель отдельной службой systemd. Подготовка входящего WireGuard-интерфейса, настройка учётной записи и подключение через SSH описаны в руководстве. [Установка веб-панели](admin.md)

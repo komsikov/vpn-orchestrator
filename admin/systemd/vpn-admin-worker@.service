@@ -1,0 +1,18 @@
+[Unit]
+Description=Apply a VPN Admin request
+
+[Service]
+Type=exec
+User=root
+UMask=0077
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/bin/python3 -Es /usr/local/libexec/vpn-orchestrator/admin/helper.py
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+RuntimeMaxSec=115
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=-/etc/amnezia -/etc/wireguard -/etc/vpn-orchestrator /run/lock

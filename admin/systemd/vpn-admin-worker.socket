@@ -1,0 +1,14 @@
+[Unit]
+Description=Private command socket for VPN Admin
+
+[Socket]
+ListenStream=/run/vpn-admin-worker.sock
+SocketUser=root
+SocketGroup=vpn-admin
+SocketMode=0660
+Accept=yes
+MaxConnections=8
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target
