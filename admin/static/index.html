@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Управление VPN</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="bar">
+    <div class="bar-inner">
+      <span class="brand">vpn-orchestrator</span>
+      <button id="logout" class="button quiet" type="button" hidden>Выйти</button>
+    </div>
+  </header>
+
+  <main>
+    <p id="boot" class="boot" role="status">Подключаемся к панели…</p>
+
+    <section id="login" class="login" aria-labelledby="login-title" hidden>
+      <h1 id="login-title">Вход в панель</h1>
+      <p class="description">Управление устройствами и исходящими туннелями VPN.</p>
+      <form id="login-form" class="login-form" action="/api/login" method="post" autocomplete="on">
+        <label for="username">Логин</label>
+        <input id="username" name="username" type="text" autocomplete="username" maxlength="128" required>
+        <label for="password">Пароль</label>
+        <input id="password" name="password" type="password" autocomplete="current-password" maxlength="512" required>
+        <button type="submit" class="button primary">Войти</button>
+      </form>
+      <p id="login-status" class="notice" role="status" hidden></p>
+    </section>
+
+    <section id="dashboard" class="dashboard" aria-label="Управление VPN" hidden>
+      <div class="connection" aria-label="Состояние VPN">
+        <div class="connection-item">
+          <span class="caption">Входящий WireGuard</span>
+          <span id="endpoint" class="address">—</span>
+        </div>
+        <div class="connection-item exit">
+          <span class="caption">Исходящий VPN</span>
+          <span id="active-upstream">Проверяем…</span>
+        </div>
+        <div class="connection-tools">
+          <span id="service-status" class="service-status" aria-live="polite">Проверяем…</span>
+          <button id="refresh" type="button" class="button quiet">Обновить</button>
+        </div>
+      </div>
+
+      <nav class="tabs" aria-label="Разделы панели">
+        <button id="devices-tab" type="button" aria-current="page" aria-controls="devices-panel">Устройства</button>
+        <button id="upstreams-tab" type="button" aria-controls="upstreams-panel">Исходящие VPN</button>
+      </nav>
+
+      <p id="dashboard-status" class="notice" role="status" hidden></p>
+
+      <section id="devices-panel" aria-labelledby="devices-title">
+        <div class="section-header">
+          <div>
+            <h1 id="devices-title">Устройства</h1>
+            <p class="description">Отдельный профиль WireGuard для каждого устройства.</p>
+          </div>
+          <button id="create-device" type="button" class="button primary" aria-expanded="false" aria-controls="device-form">Добавить устройство</button>
+        </div>
+
+        <form id="device-form" class="editor" action="/api/devices" method="post" hidden>
+          <label for="device-name">Имя устройства</label>
+          <input id="device-name" name="name" placeholder="Например, MacBook" maxlength="64" required>
+          <div class="form-actions">
+            <button type="submit" class="button primary">Создать профиль</button>
+            <button id="cancel-device" type="button" class="button secondary">Отмена</button>
+          </div>
+        </form>
+
+        <div id="device-download" class="download" hidden>
+          <div>
+            <p id="download-title" class="download-title"></p>
+            <p class="description">Сохрани файл и импортируй его в WireGuard на этом устройстве.</p>
+          </div>
+          <a id="download-link" class="button primary" download>Скачать .conf</a>
+          <button id="dismiss-download" type="button" class="button quiet">Закрыть</button>
+        </div>
+
+        <div id="devices-table" class="table-shell" hidden>
+          <table role="table">
+            <thead>
+              <tr>
+                <th scope="col">Устройство</th>
+                <th scope="col">VPN-адрес</th>
+                <th scope="col">Последнее подключение</th>
+                <th scope="col"><span class="sr-only">Действия</span></th>
+              </tr>
+            </thead>
+            <tbody id="device-rows"></tbody>
+          </table>
+        </div>
+        <p id="devices-empty" class="empty">Загружаем устройства…</p>
+      </section>
+
+      <section id="upstreams-panel" aria-labelledby="upstreams-title" hidden>
+        <div class="section-header">
+          <div>
+            <h1 id="upstreams-title">Исходящие VPN</h1>
+            <p class="description">Туннели, через которые устройства выходят в интернет.</p>
+          </div>
+          <button id="create-upstream" type="button" class="button primary" aria-expanded="false" aria-controls="upstream-form">Добавить туннель</button>
+        </div>
+
+        <form id="upstream-form" class="editor" action="/api/upstreams" method="post" autocomplete="off" hidden>
+          <h2 id="upstream-form-title">Добавить туннель</h2>
+          <div class="editor-grid">
+            <div class="field">
+              <label for="upstream-name">Название</label>
+              <input id="upstream-name" name="name" maxlength="64" required>
+            </div>
+            <div class="field">
+              <label for="upstream-kind">Протокол</label>
+              <select id="upstream-kind" name="kind" required>
+                <option value="amneziawg">AmneziaWG</option>
+                <option value="wireguard">WireGuard</option>
+              </select>
+            </div>
+          </div>
+          <div class="config-heading">
+            <label for="upstream-config">Конфигурация</label>
+            <label class="button secondary file-control" for="upstream-file">Выбрать .conf</label>
+            <input id="upstream-file" class="sr-only" type="file" accept=".conf,.txt,text/plain">
+          </div>
+          <textarea id="upstream-config" name="config" rows="9" maxlength="65536" spellcheck="false" autocapitalize="off" autocomplete="off" placeholder="Вставь конфигурацию WireGuard или AmneziaWG" required></textarea>
+          <div class="form-actions">
+            <button type="submit" class="button primary">Применить</button>
+            <button id="cancel-upstream" type="button" class="button secondary">Отмена</button>
+          </div>
+        </form>
+
+        <div id="upstreams-table" class="table-shell" hidden>
+          <table role="table">
+            <thead>
+              <tr>
+                <th scope="col">Туннель</th>
+                <th scope="col">Протокол</th>
+                <th scope="col">Состояние</th>
+                <th scope="col"><span class="sr-only">Действия</span></th>
+              </tr>
+            </thead>
+            <tbody id="upstream-rows"></tbody>
+          </table>
+        </div>
+        <p id="upstreams-empty" class="empty">Загружаем исходящие туннели…</p>
+      </section>
+    </section>
+  </main>
+</body>
+</html>

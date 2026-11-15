@@ -31,6 +31,10 @@ sudo vpn-orchestrator -c /etc/vpn-orchestrator/config.toml
 
 Перед первым запуском настройте серверный интерфейс и хотя бы один включённый `[[upstream]]`. Полный пример находится в [config.example.toml](config.example.toml).
 
+## Веб-панель
+
+Через панель можно выпускать и отзывать клиентские профили WireGuard, проверять состояние сервиса, добавлять и заменять исходящие конфиги WireGuard и AmneziaWG. Панель устанавливается отдельно на хост с systemd. [Установка веб-панели](docs/admin.md)
+
 ## Документация
 
 - [Конфигурация и маршрутизация](docs/configuration.md) — все секции TOML, `enabled = false`, NAT, таблицы и WG/Xray-конфиги.

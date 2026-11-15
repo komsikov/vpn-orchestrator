@@ -1,0 +1,9 @@
+endpoint = "vpn.example.net:51820"
+listen_port = 8787
+client_dns = ["1.1.1.1", "1.0.0.1"]
+client_mtu = 1280
+orchestrator_config = "/etc/vpn-orchestrator/config.toml"
+
+# Укажите оба значения, чтобы панель слушала адрес внутри WireGuard.
+# vpn_bind_ipv4 = "10.42.42.1"
+# vpn_client_network = "10.42.42.0/24"
